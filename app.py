@@ -1765,49 +1765,95 @@ def calculate_daily_composite_score_v2(forecast_results, t0_score, current_price
 def calculate_real_confidence(method_results):
     """
     Tính độ tin cậy thực sự dựa trên sự đồng thuận của 12 phương pháp
-    """
-    if not method_results:
-        return 0.5, "Không có dữ liệu"
     
-    directions = {'up': 0, 'down': 0, 'neutral': 0}
+    Returns:
+        tuple: (confidence_score, explanation_text)
+    """
+    if not method_results or not isinstance(method_results, dict):
+        return 0.5, "Không có dữ liệu phương pháp"
+    
+    # Trọng số cho từng phương pháp
     method_weights = {
-        'linear_regression': 1.5,      # Trọng số cao cho regression
-        'polynomial_regression': 1.5,
-        'fourier_transform': 1.2,
-        'pattern_matching': 1.3,
-        'fibonacci_levels': 1.0,
-        'first_derivative': 1.0,
-        'second_derivative': 1.0,
-        'peak_trough': 1.4,            # Quan trọng cho đảo chiều
+        'linear': 1.5,
+        'polynomial': 1.5,
+        'fourier': 1.2,
+        'pattern': 1.3,
+        'fibonacci': 1.0,
+        'velocity': 1.0,
+        'acceleration': 1.0,
+        'peak_trough': 1.4,
         'multi_timeframe': 1.2,
-        'probability_stats': 1.1,
-        'logical_rules': 0.8,
-        'ml_ensemble': 1.3
+        'statistics': 1.1,
+        'logical': 0.8,
+        'ensemble': 1.3
     }
     
     total_weight = 0
     weighted_votes = {'up': 0, 'down': 0, 'neutral': 0}
+    active_methods = 0
+    confidences = []
     
-    for method_name, result in method_results.items():
-        if result is None:
+    for method_key, method_data in method_results.items():
+        if method_data is None or not isinstance(method_data, dict):
             continue
         
-        weight = method_weights.get(method_name, 1.0)
+        active_methods += 1
+        weight = method_weights.get(method_key, 1.0)
         total_weight += weight
         
-        # Lấy hướng dự báo từ method
-        forecast = result.get('forecast', {})
-        t5_val = forecast.get('T5', 50)
-        t1_val = forecast.get('T1', 50)
+        # Lấy confidence của phương pháp
+        method_conf = method_data.get('confidence', 50)
+        if isinstance(method_conf, (int, float)):
+            confidences.append(method_conf)
         
-        if t5_val > t1_val + 2:
+        # Xác định hướng từ nhiều nguồn
+        direction = None
+        
+        # Từ trường 'trend'
+        trend = method_data.get('trend', '')
+        if isinstance(trend, str):
+            trend_upper = trend.upper()
+            if any(x in trend_upper for x in ['TĂNG', 'UP', 'BULLISH', 'MUA']):
+                direction = 'up'
+            elif any(x in trend_upper for x in ['GIẢM', 'DOWN', 'BEARISH', 'BÁN']):
+                direction = 'down'
+        
+        # Từ trường 'signal'
+        if direction is None:
+            signal = method_data.get('signal', '')
+            if isinstance(signal, str):
+                signal_upper = signal.upper()
+                if any(x in signal_upper for x in ['TĂNG', 'UP', 'BULLISH', 'MUA', 'BUY']):
+                    direction = 'up'
+                elif any(x in signal_upper for x in ['GIẢM', 'DOWN', 'BEARISH', 'BÁN', 'SELL']):
+                    direction = 'down'
+        
+        # Từ forecasts (so sánh T5 vs T1)
+        if direction is None:
+            forecasts = method_data.get('forecasts', {})
+            if isinstance(forecasts, dict):
+                t5 = forecasts.get('T5')
+                t1 = forecasts.get('T1')
+                if t5 is not None and t1 is not None:
+                    try:
+                        t5_val = float(t5)
+                        t1_val = float(t1)
+                        if t5_val > t1_val * 1.02:
+                            direction = 'up'
+                        elif t5_val < t1_val * 0.98:
+                            direction = 'down'
+                    except (ValueError, TypeError):
+                        pass
+        
+        # Vote
+        if direction == 'up':
             weighted_votes['up'] += weight
-        elif t5_val < t1_val - 2:
+        elif direction == 'down':
             weighted_votes['down'] += weight
         else:
             weighted_votes['neutral'] += weight
     
-    if total_weight == 0:
+    if total_weight == 0 or active_methods == 0:
         return 0.5, "Không đủ dữ liệu"
     
     # Tính tỷ lệ đồng thuận
@@ -1815,227 +1861,425 @@ def calculate_real_confidence(method_results):
     max_votes = weighted_votes[max_direction]
     
     # Confidence = tỷ lệ phương pháp đồng ý / tổng
-    confidence = max_votes / total_weight
+    agreement_ratio = max_votes / total_weight
+    
+    # Kết hợp với confidence trung bình của các phương pháp
+    avg_method_confidence = np.mean(confidences) / 100 if confidences else 0.5
+    
+    # Confidence cuối = 60% từ agreement + 40% từ avg confidence
+    confidence = agreement_ratio * 0.6 + avg_method_confidence * 0.4
     
     # Điều chỉnh: nếu quá ít phương pháp hoạt động, giảm confidence
-    active_methods = sum(1 for r in method_results.values() if r is not None)
     if active_methods < 6:
         confidence *= (active_methods / 12)
     
+    # Bonus nếu có sự đồng thuận cao
+    if agreement_ratio > 0.7:
+        confidence = min(confidence * 1.1, 0.95)
+    
+    # Giới hạn trong khoảng 0.3 - 0.95
+    confidence = max(0.3, min(0.95, confidence))
+    
     # Tạo giải thích
-    explanation = f"{active_methods}/12 PP hoạt động, {int(max_votes)}/{int(total_weight)} vote {max_direction.upper()}"
+    direction_vn = {'up': 'TĂNG', 'down': 'GIẢM', 'neutral': 'ĐI NGANG'}
+    up_pct = weighted_votes['up'] / total_weight * 100
+    down_pct = weighted_votes['down'] / total_weight * 100
+    
+    explanation = f"{active_methods}/12 PP hoạt động | {up_pct:.0f}% TĂNG, {down_pct:.0f}% GIẢM | Đồng thuận: {direction_vn[max_direction]}"
     
     return round(confidence, 2), explanation
 
 
 # =============================================================================
-# SỬA LỖI 2: PHÁT HIỆN ĐẢNG CHIỀU (TURNING POINTS)
+# SỬA LỖI 2: PHÁT HIỆN ĐẢO CHIỀU (TURNING POINTS) - CẬP NHẬT
 # =============================================================================
 
 def detect_turning_points(df, indicator_results):
     """
     Phát hiện các điểm đảo chiều từ dữ liệu lịch sử
+    Trả về dict với đầy đủ thông tin
     """
     turning_points = {
         'detected': False,
-        'type': None,           # 'peak' hoặc 'trough'
+        'type': None,
         'confidence': 0,
         'days_from_turn': None,
         'historical_similar': [],
-        'warning': None
+        'warning': None,
+        'details': [],  # THÊM: Chi tiết các phát hiện
+        'signals': []   # THÊM: Các tín hiệu cụ thể
     }
     
     if df is None or len(df) < 30:
         return turning_points
     
-    close = df['Close'].values if 'Close' in df.columns else None
+    close = df['close'].values if 'close' in df.columns else None
     if close is None or len(close) < 30:
         return turning_points
     
-    # 1. Phát hiện đỉnh/đáy gần đây (trong 10 ngày)
-    from scipy.signal import argrelextrema
-    
-    # Tìm đỉnh cục bộ (order=5 = so sánh với 5 điểm trước/sau)
-    peaks_idx = argrelextrema(close, np.greater, order=5)[0]
-    troughs_idx = argrelextrema(close, np.less, order=5)[0]
-    
+    current_price = close[-1]
     current_idx = len(close) - 1
     
-    # Kiểm tra đỉnh gần nhất
-    if len(peaks_idx) > 0:
-        last_peak_idx = peaks_idx[-1]
-        days_from_peak = current_idx - last_peak_idx
+    # 1. Phát hiện đỉnh/đáy gần đây (trong 10 ngày)
+    try:
+        from scipy.signal import argrelextrema
         
-        if days_from_peak <= 10:
-            # Vừa tạo đỉnh trong 10 ngày
-            peak_price = close[last_peak_idx]
-            current_price = close[-1]
-            drop_pct = (current_price - peak_price) / peak_price * 100
-            
-            if drop_pct < -2:  # Giảm > 2% từ đỉnh
-                turning_points['detected'] = True
-                turning_points['type'] = 'peak_reversal'
-                turning_points['days_from_turn'] = days_from_peak
-                turning_points['warning'] = f"⚠️ VỪA TẠO ĐỈNH {days_from_peak} ngày trước, đã giảm {abs(drop_pct):.1f}%"
-                turning_points['confidence'] = min(0.9, abs(drop_pct) / 10)
-    
-    # Kiểm tra đáy gần nhất
-    if len(troughs_idx) > 0:
-        last_trough_idx = troughs_idx[-1]
-        days_from_trough = current_idx - last_trough_idx
+        # Tìm đỉnh cục bộ
+        peaks_idx = argrelextrema(close, np.greater, order=5)[0]
+        troughs_idx = argrelextrema(close, np.less, order=5)[0]
         
-        if days_from_trough <= 10:
-            trough_price = close[last_trough_idx]
-            current_price = close[-1]
-            rise_pct = (current_price - trough_price) / trough_price * 100
+        # Kiểm tra đỉnh gần nhất
+        if len(peaks_idx) > 0:
+            last_peak_idx = peaks_idx[-1]
+            days_from_peak = current_idx - last_peak_idx
             
-            if rise_pct > 2:  # Tăng > 2% từ đáy
-                turning_points['detected'] = True
-                turning_points['type'] = 'trough_reversal'
-                turning_points['days_from_turn'] = days_from_trough
-                turning_points['warning'] = f"🔄 VỪA TẠO ĐÁY {days_from_trough} ngày trước, đã tăng {rise_pct:.1f}%"
-                turning_points['confidence'] = min(0.9, rise_pct / 10)
+            if days_from_peak <= 10 and days_from_peak > 0:
+                peak_price = close[last_peak_idx]
+                drop_pct = (current_price - peak_price) / peak_price * 100
+                
+                if drop_pct < -3:  # Giảm > 3% từ đỉnh
+                    turning_points['detected'] = True
+                    turning_points['type'] = 'peak_reversal'
+                    turning_points['days_from_turn'] = days_from_peak
+                    turning_points['confidence'] = min(0.9, abs(drop_pct) / 15)
+                    
+                    detail = f"📉 VỪA TẠO ĐỈNH {days_from_peak} ngày trước tại {peak_price:,.0f}, đã giảm {abs(drop_pct):.1f}%"
+                    turning_points['details'].append(detail)
+                    turning_points['warning'] = detail
+                    turning_points['signals'].append({
+                        'type': 'PEAK_FORMED',
+                        'price': peak_price,
+                        'days_ago': days_from_peak,
+                        'change_pct': drop_pct
+                    })
+        
+        # Kiểm tra đáy gần nhất
+        if len(troughs_idx) > 0:
+            last_trough_idx = troughs_idx[-1]
+            days_from_trough = current_idx - last_trough_idx
+            
+            if days_from_trough <= 10 and days_from_trough > 0:
+                trough_price = close[last_trough_idx]
+                rise_pct = (current_price - trough_price) / trough_price * 100
+                
+                if rise_pct > 3:  # Tăng > 3% từ đáy
+                    turning_points['detected'] = True
+                    turning_points['type'] = 'trough_reversal'
+                    turning_points['days_from_turn'] = days_from_trough
+                    turning_points['confidence'] = min(0.9, rise_pct / 15)
+                    
+                    detail = f"📈 VỪA TẠO ĐÁY {days_from_trough} ngày trước tại {trough_price:,.0f}, đã tăng {rise_pct:.1f}%"
+                    turning_points['details'].append(detail)
+                    if not turning_points['warning']:
+                        turning_points['warning'] = detail
+                    else:
+                        turning_points['warning'] += f"\n{detail}"
+                    turning_points['signals'].append({
+                        'type': 'TROUGH_FORMED',
+                        'price': trough_price,
+                        'days_ago': days_from_trough,
+                        'change_pct': rise_pct
+                    })
+    except Exception as e:
+        print(f"Lỗi phát hiện đỉnh/đáy: {e}")
     
     # 2. Kiểm tra RSI divergence (phân kỳ)
     if 'RSI' in df.columns:
-        rsi = df['RSI'].values
-        
-        # Phân kỳ âm: giá tăng nhưng RSI giảm
-        if len(close) >= 20 and len(rsi) >= 20:
-            price_trend = (close[-1] - close[-20]) / close[-20] * 100
-            rsi_trend = rsi[-1] - rsi[-20]
+        try:
+            rsi = df['RSI'].values
             
-            if price_trend > 5 and rsi_trend < -10:
-                turning_points['detected'] = True
-                turning_points['type'] = 'bearish_divergence'
-                turning_points['warning'] = f"⚠️ PHÂN KỲ ÂM: Giá +{price_trend:.1f}% nhưng RSI -{abs(rsi_trend):.1f}"
-                turning_points['confidence'] = 0.75
-            
-            elif price_trend < -5 and rsi_trend > 10:
-                turning_points['detected'] = True
-                turning_points['type'] = 'bullish_divergence'
-                turning_points['warning'] = f"🔄 PHÂN KỲ DƯƠNG: Giá {price_trend:.1f}% nhưng RSI +{rsi_trend:.1f}"
-                turning_points['confidence'] = 0.75
-    
-    # 3. So sánh với các điểm tương tự trong lịch sử
-    if len(close) >= 252:  # Ít nhất 1 năm
-        current_pattern = close[-20:] / close[-20] * 100  # Normalize
-        
-        similar_patterns = []
-        for i in range(252, len(close) - 25, 20):
-            hist_pattern = close[i-20:i] / close[i-20] * 100
-            
-            # Tính correlation
-            if len(hist_pattern) == len(current_pattern):
-                corr = np.corrcoef(current_pattern, hist_pattern)[0, 1]
+            if len(close) >= 20 and len(rsi) >= 20:
+                # Lấy dữ liệu 20 ngày gần nhất
+                close_20 = close[-20:]
+                rsi_20 = rsi[-20:]
                 
-                if corr > 0.85:  # Tương tự > 85%
-                    # Xem sau đó giá đi như nào
-                    future_return = (close[i+5] - close[i]) / close[i] * 100
-                    similar_patterns.append({
-                        'date_idx': i,
-                        'correlation': corr,
-                        'future_5d_return': future_return
-                    })
-        
-        if similar_patterns:
-            avg_future = np.mean([p['future_5d_return'] for p in similar_patterns])
-            turning_points['historical_similar'] = similar_patterns[:5]
+                # Loại bỏ NaN
+                valid_mask = ~np.isnan(rsi_20)
+                if np.sum(valid_mask) >= 15:
+                    price_trend = (close_20[-1] - close_20[0]) / close_20[0] * 100
+                    
+                    # Tính RSI trend (bỏ qua NaN)
+                    rsi_valid = rsi_20[valid_mask]
+                    rsi_trend = rsi_valid[-1] - rsi_valid[0] if len(rsi_valid) > 1 else 0
+                    
+                    # Phân kỳ âm: giá tăng nhưng RSI giảm
+                    if price_trend > 5 and rsi_trend < -10:
+                        turning_points['detected'] = True
+                        turning_points['type'] = 'bearish_divergence'
+                        turning_points['confidence'] = max(turning_points['confidence'], 0.75)
+                        
+                        detail = f"⚠️ PHÂN KỲ ÂM: Giá +{price_trend:.1f}% nhưng RSI {rsi_trend:.1f} (20 ngày)"
+                        turning_points['details'].append(detail)
+                        if turning_points['warning']:
+                            turning_points['warning'] += f"\n{detail}"
+                        else:
+                            turning_points['warning'] = detail
+                        turning_points['signals'].append({
+                            'type': 'BEARISH_DIVERGENCE',
+                            'price_change': price_trend,
+                            'rsi_change': rsi_trend
+                        })
+                    
+                    # Phân kỳ dương: giá giảm nhưng RSI tăng
+                    elif price_trend < -5 and rsi_trend > 10:
+                        turning_points['detected'] = True
+                        turning_points['type'] = 'bullish_divergence'
+                        turning_points['confidence'] = max(turning_points['confidence'], 0.75)
+                        
+                        detail = f"🔄 PHÂN KỲ DƯƠNG: Giá {price_trend:.1f}% nhưng RSI +{rsi_trend:.1f} (20 ngày)"
+                        turning_points['details'].append(detail)
+                        if turning_points['warning']:
+                            turning_points['warning'] += f"\n{detail}"
+                        else:
+                            turning_points['warning'] = detail
+                        turning_points['signals'].append({
+                            'type': 'BULLISH_DIVERGENCE',
+                            'price_change': price_trend,
+                            'rsi_change': rsi_trend
+                        })
+        except Exception as e:
+            print(f"Lỗi phân tích RSI divergence: {e}")
+    
+    # 3. Kiểm tra MACD crossover gần đây
+    if 'MACD_Hist' in df.columns:
+        try:
+            macd_hist = df['MACD_Hist'].values
             
-            if avg_future < -3:
-                turning_points['warning'] = (turning_points.get('warning', '') + 
-                    f"\n📉 Lịch sử: {len(similar_patterns)} lần tương tự → TB giảm {abs(avg_future):.1f}%")
-            elif avg_future > 3:
-                turning_points['warning'] = (turning_points.get('warning', '') + 
-                    f"\n📈 Lịch sử: {len(similar_patterns)} lần tương tự → TB tăng {avg_future:.1f}%")
+            # Tìm crossover trong 5 ngày gần nhất
+            for i in range(1, min(6, len(macd_hist))):
+                if i >= len(macd_hist):
+                    break
+                    
+                prev_hist = macd_hist[-(i+1)]
+                curr_hist = macd_hist[-i]
+                
+                if pd.notna(prev_hist) and pd.notna(curr_hist):
+                    if prev_hist < 0 and curr_hist > 0:
+                        detail = f"🔼 MACD Cross Up cách đây {i} ngày"
+                        turning_points['details'].append(detail)
+                        turning_points['signals'].append({
+                            'type': 'MACD_CROSS_UP',
+                            'days_ago': i
+                        })
+                        if not turning_points['detected']:
+                            turning_points['detected'] = True
+                            turning_points['type'] = 'macd_bullish_cross'
+                            turning_points['confidence'] = 0.65
+                        break
+                    elif prev_hist > 0 and curr_hist < 0:
+                        detail = f"🔽 MACD Cross Down cách đây {i} ngày"
+                        turning_points['details'].append(detail)
+                        turning_points['signals'].append({
+                            'type': 'MACD_CROSS_DOWN',
+                            'days_ago': i
+                        })
+                        if not turning_points['detected']:
+                            turning_points['detected'] = True
+                            turning_points['type'] = 'macd_bearish_cross'
+                            turning_points['confidence'] = 0.65
+                        break
+        except Exception as e:
+            print(f"Lỗi phân tích MACD: {e}")
+    
+    # 4. Kiểm tra xu hướng thay đổi (momentum shift)
+    if len(close) >= 10:
+        try:
+            # Tính momentum ngắn hạn vs trung hạn
+            mom_5d = (close[-1] - close[-5]) / close[-5] * 100 if len(close) >= 5 else 0
+            mom_10d = (close[-1] - close[-10]) / close[-10] * 100 if len(close) >= 10 else 0
+            
+            # Momentum đang đảo chiều
+            if mom_10d < -5 and mom_5d > 2:
+                detail = f"📊 Momentum đảo chiều TĂNG: 10d={mom_10d:.1f}%, 5d={mom_5d:+.1f}%"
+                turning_points['details'].append(detail)
+                if not turning_points['detected']:
+                    turning_points['detected'] = True
+                    turning_points['type'] = 'momentum_shift_up'
+                    turning_points['confidence'] = 0.6
+            elif mom_10d > 5 and mom_5d < -2:
+                detail = f"📊 Momentum đảo chiều GIẢM: 10d=+{mom_10d:.1f}%, 5d={mom_5d:.1f}%"
+                turning_points['details'].append(detail)
+                if not turning_points['detected']:
+                    turning_points['detected'] = True
+                    turning_points['type'] = 'momentum_shift_down'
+                    turning_points['confidence'] = 0.6
+        except Exception as e:
+            print(f"Lỗi phân tích momentum: {e}")
+    
+    # 5. So sánh với lịch sử (nếu có đủ dữ liệu)
+    if len(close) >= 252:  # Ít nhất 1 năm
+        try:
+            current_pattern = close[-20:] / close[-20] * 100
+            
+            similar_patterns = []
+            for i in range(252, len(close) - 25, 20):
+                hist_pattern = close[i-20:i] / close[i-20] * 100
+                
+                if len(hist_pattern) == len(current_pattern):
+                    corr = np.corrcoef(current_pattern, hist_pattern)[0, 1]
+                    
+                    if corr > 0.85:
+                        future_return = (close[i+5] - close[i]) / close[i] * 100
+                        similar_patterns.append({
+                            'date_idx': i,
+                            'correlation': corr,
+                            'future_5d_return': future_return
+                        })
+            
+            if len(similar_patterns) >= 3:
+                avg_future = np.mean([p['future_5d_return'] for p in similar_patterns])
+                turning_points['historical_similar'] = similar_patterns[:5]
+                
+                if avg_future < -3:
+                    detail = f"📉 Lịch sử: {len(similar_patterns)} mẫu tương tự → TB giảm {abs(avg_future):.1f}% trong 5 ngày"
+                    turning_points['details'].append(detail)
+                elif avg_future > 3:
+                    detail = f"📈 Lịch sử: {len(similar_patterns)} mẫu tương tự → TB tăng {avg_future:.1f}% trong 5 ngày"
+                    turning_points['details'].append(detail)
+        except Exception as e:
+            print(f"Lỗi so sánh lịch sử: {e}")
     
     return turning_points
 
 
 # =============================================================================
-# SỬA LỖI 3: DỰ BÁO KHÔNG CÒN 1 CHIỀU
+# SỬA LỖI 3: DỰ BÁO CÓ DAO ĐỘNG (KHÔNG CÒN 1 CHIỀU)
 # =============================================================================
 
-def calculate_realistic_forecast(method_results, current_price, atr, turning_points):
+def calculate_realistic_forecast(indicator_results, current_price, atr_value, turning_points):
     """
-    Tính dự báo thực tế hơn, không phải đường thẳng
+    Tính dự báo thực tế hơn, có dao động, không phải đường thẳng
     """
     forecasts = {}
     
-    if not method_results:
+    if current_price is None or current_price <= 0:
+        for day in ['T1', 'T2', 'T3', 'T4', 'T5']:
+            forecasts[day] = {
+                'score': 50,
+                'price': 0,
+                'change_pct': 0,
+                'direction': 'neutral',
+                'volatility_range': (0, 0)
+            }
         return forecasts
     
-    # Thu thập dự báo từ các phương pháp
-    all_t1, all_t2, all_t3, all_t4, all_t5 = [], [], [], [], []
+    # Xử lý ATR
+    if atr_value is None or atr_value <= 0:
+        atr_value = current_price * 0.02
     
-    for method_name, result in method_results.items():
-        if result is None:
-            continue
+    volatility = atr_value / current_price
+    
+    # Lấy điểm tổng hợp từ indicator_results
+    base_scores = {}
+    overall_bias = 0
+    
+    if indicator_results and isinstance(indicator_results, dict):
+        combined = indicator_results.get('combined_forecast', {})
         
-        forecast = result.get('forecast', {})
-        if 'T1' in forecast: all_t1.append(forecast['T1'])
-        if 'T2' in forecast: all_t2.append(forecast['T2'])
-        if 'T3' in forecast: all_t3.append(forecast['T3'])
-        if 'T4' in forecast: all_t4.append(forecast['T4'])
-        if 'T5' in forecast: all_t5.append(forecast['T5'])
-    
-    # Tính giá trị trung vị (robust hơn mean)
-    def safe_median(arr):
-        return np.median(arr) if len(arr) > 0 else 50
-    
-    base_forecasts = {
-        'T1': safe_median(all_t1),
-        'T2': safe_median(all_t2),
-        'T3': safe_median(all_t3),
-        'T4': safe_median(all_t4),
-        'T5': safe_median(all_t5)
-    }
+        # Xử lý scores
+        if isinstance(combined, dict):
+            scores = combined.get('scores', {})
+            if isinstance(scores, dict):
+                for key in ['T1', 'T2', 'T3', 'T4', 'T5']:
+                    if key in scores:
+                        val = scores[key]
+                        if isinstance(val, (int, float)):
+                            base_scores[key] = float(val)
+        
+        # Lấy xu hướng tổng
+        summary = indicator_results.get('summary', {})
+        if isinstance(summary, dict):
+            trend = summary.get('overall_trend', '')
+            if isinstance(trend, str):
+                if 'TĂNG' in trend.upper():
+                    overall_bias = 0.6
+                elif 'GIẢM' in trend.upper():
+                    overall_bias = -0.6
     
     # Điều chỉnh theo turning points
-    adjustment_factor = 1.0
-    if turning_points.get('detected'):
+    turn_adjustment = 0
+    turn_volatility_mult = 1.0
+    
+    if turning_points and isinstance(turning_points, dict) and turning_points.get('detected'):
         turn_type = turning_points.get('type', '')
+        turn_conf = turning_points.get('confidence', 0.5)
         
-        if 'peak' in turn_type or 'bearish' in turn_type:
-            # Vừa tạo đỉnh hoặc phân kỳ âm -> giảm dự báo
-            adjustment_factor = 0.85
-        elif 'trough' in turn_type or 'bullish' in turn_type:
-            # Vừa tạo đáy hoặc phân kỳ dương -> tăng dự báo
-            adjustment_factor = 1.15
+        try:
+            turn_conf = float(turn_conf)
+        except:
+            turn_conf = 0.5
+        
+        if isinstance(turn_type, str):
+            if 'bearish' in turn_type.lower() or 'peak' in turn_type.lower():
+                turn_adjustment = -0.3 * turn_conf
+                turn_volatility_mult = 1.2
+            elif 'bullish' in turn_type.lower() or 'trough' in turn_type.lower():
+                turn_adjustment = 0.3 * turn_conf
+                turn_volatility_mult = 1.2
     
-    # Tính giá dự báo (với biến động, không phải đường thẳng)
-    volatility = atr / current_price if current_price > 0 else 0.02
-    
-    for day, score in base_forecasts.items():
-        # Score 50 = không đổi, >50 = tăng, <50 = giảm
-        change_factor = (score - 50) / 50  # -1 to +1
-        change_factor *= adjustment_factor
+    # Tính dự báo cho từng ngày với DAO ĐỘNG
+    for i, day in enumerate(['T1', 'T2', 'T3', 'T4', 'T5'], 1):
+        # Điểm cơ bản
+        base_score = base_scores.get(day, 50)
         
-        # Thêm biến động ngẫu nhiên theo ATR
-        day_num = int(day[1])
-        random_factor = np.sin(day_num * 1.5) * volatility * 0.5  # Tạo dao động
+        # Thêm dao động theo ngày (sine wave)
+        wave = np.sin(i * 0.7) * 5  # Dao động ±5 điểm
         
-        price_change = change_factor * volatility * day_num + random_factor
-        forecast_price = current_price * (1 + price_change)
+        # Thêm xu hướng
+        trend_component = overall_bias * i * 3
+        
+        # Thêm turning point adjustment
+        turn_component = turn_adjustment * 10 * (1 - i * 0.1)  # Giảm dần theo thời gian
+        
+        # Điểm cuối cùng
+        final_score = base_score + wave + trend_component + turn_component
+        final_score = max(20, min(80, final_score))
+        
+        # Tính % thay đổi từ score
+        score_bias = (final_score - 50) / 50  # -1 to 1
+        
+        # Base change từ score
+        base_change = score_bias * volatility * i * 0.8
+        
+        # Thêm wave component cho giá
+        price_wave = np.sin(i * 0.9) * volatility * 0.3
+        
+        # Turning point adjustment cho giá
+        price_turn_adj = turn_adjustment * volatility * i * 0.5
+        
+        # Tổng % thay đổi
+        total_change = base_change + price_wave + price_turn_adj
+        
+        # Tính giá
+        forecast_price = current_price * (1 + total_change)
+        
+        # Tính range (uncertainty tăng theo thời gian)
+        uncertainty = volatility * i * 0.5 * turn_volatility_mult
+        price_low = forecast_price * (1 - uncertainty)
+        price_high = forecast_price * (1 + uncertainty)
+        
+        # Xác định hướng
+        if total_change > 0.005:
+            direction = 'up'
+        elif total_change < -0.005:
+            direction = 'down'
+        else:
+            direction = 'neutral'
         
         forecasts[day] = {
-            'score': round(score * adjustment_factor, 1),
+            'score': round(final_score, 1),
             'price': round(forecast_price, 2),
-            'change_pct': round(price_change * 100, 2),
-            'direction': 'up' if price_change > 0.005 else ('down' if price_change < -0.005 else 'neutral')
+            'change_pct': round(total_change * 100, 2),
+            'direction': direction,
+            'volatility_range': (round(price_low, 2), round(price_high, 2)),
+            'confidence': round(max(0.3, 0.8 - i * 0.1), 2)  # Confidence giảm theo thời gian
         }
     
     return forecasts
 
-
 def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current_price=None, atr_value=None):
     """
-    PHIÊN BẢN 2.0 ĐÃ SỬA: Hàm tổng hợp để chạy 12 phương pháp dự báo
-    
-    Sửa lỗi:
-    - Độ tin cậy tính thực sự từ 12 PP (không còn luôn 50%)
-    - Phát hiện đảo chiều (turning points)
-    - Dự báo có dao động (không còn 1 chiều)
+    PHIÊN BẢN ĐÃ SỬA
     """
     
     result = {
@@ -2052,49 +2296,62 @@ def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current
     }
     
     try:
-        # Lấy giá hiện tại nếu chưa có
+        # Lấy giá hiện tại
         if current_price is None:
-            close_col = 'Close' if 'Close' in df.columns else 'close'
+            close_col = 'close' if 'close' in df.columns else 'Close'
             if close_col in df.columns:
                 current_price = float(df[close_col].iloc[-1])
             else:
                 current_price = 0
         
-        # Lấy ATR nếu chưa có
+        # Lấy ATR
         if atr_value is None:
             atr_col = 'ATR' if 'ATR' in df.columns else 'atr'
             if atr_col in df.columns:
                 atr_value = float(df[atr_col].iloc[-1])
             else:
-                atr_value = current_price * 0.02  # Mặc định 2%
+                atr_value = current_price * 0.02
         
-        # 1. Chạy dự báo 12 phương pháp cho các chỉ báo
+        # 1. Chạy dự báo 12 phương pháp
         print(f"\n[1/5] Đang chạy 12 phương pháp cho {symbol}...")
         indicator_forecast_results = forecast_all_26_indicators_v2(df, None)
         result['indicator_forecasts'] = indicator_forecast_results
         
-        # 2. TÍNH ĐỘ TIN CẬY THỰC SỰ (SỬA LỖI LUÔN 50%)
+        # 2. TÍNH ĐỘ TIN CẬY - SỬA: Lấy đúng method_results
         print(f"[2/5] Đang tính độ tin cậy...")
-        sample_method_results = None
+        sample_method_results = {}
+        
         if indicator_forecast_results:
-            for ind_name, ind_data in indicator_forecast_results.get('individual_forecasts', {}).items():
-                if ind_data and ind_data.get('detailed_methods'):
-                    sample_method_results = ind_data['detailed_methods']
-                    break
+            individual = indicator_forecast_results.get('individual_forecasts', {})
+            for ind_name, ind_data in individual.items():
+                if ind_data and isinstance(ind_data, dict):
+                    detailed = ind_data.get('detailed')
+                    if detailed and isinstance(detailed, dict):
+                        methods = detailed.get('methods')
+                        if methods and isinstance(methods, dict) and len(methods) > 0:
+                            sample_method_results = methods
+                            print(f"   → Lấy methods từ {ind_name}: {len(methods)} phương pháp")
+                            break
         
         confidence, conf_explanation = calculate_real_confidence(sample_method_results)
         result['confidence'] = confidence
         result['confidence_explanation'] = conf_explanation
+        print(f"   → Độ tin cậy: {confidence*100:.0f}% ({conf_explanation})")
         
-        # 3. PHÁT HIỆN ĐẢO CHIỀU (SỬA LỖI KHÔNG CẢNH BÁO)
+        # 3. PHÁT HIỆN ĐẢO CHIỀU
         print(f"[3/5] Đang phát hiện đảo chiều...")
         turning_points = detect_turning_points(df, indicator_forecast_results)
         result['turning_points'] = turning_points
         
-        if turning_points.get('warning'):
-            result['warnings'].append(turning_points['warning'])
+        if turning_points.get('detected'):
+            print(f"   → PHÁT HIỆN: {turning_points.get('type')}")
+            for detail in turning_points.get('details', []):
+                print(f"      {detail}")
+                result['warnings'].append(detail)
+        else:
+            print(f"   → Không phát hiện đảo chiều")
         
-        # 4. TÍNH DỰ BÁO THỰC TẾ (SỬA LỖI 1 CHIỀU)
+        # 4. TÍNH DỰ BÁO THỰC TẾ (có dao động)
         print(f"[4/5] Đang tính dự báo thực tế...")
         realistic_forecasts = calculate_realistic_forecast(
             indicator_forecast_results,
@@ -2104,7 +2361,7 @@ def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current
         )
         result['realistic_forecasts'] = realistic_forecasts
         
-        # 5. Tính điểm tổng hợp (cập nhật với giá trị mới)
+        # 5. Tính điểm tổng hợp
         print(f"[5/5] Đang tính điểm tổng hợp...")
         daily_composite = calculate_daily_composite_score_v2(
             indicator_forecast_results, 
@@ -2113,24 +2370,28 @@ def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current
             atr_value
         )
         
-        # Cập nhật daily_composite với realistic forecasts và confidence
-        if daily_composite:
+        # Cập nhật với realistic forecasts
+        if daily_composite and realistic_forecasts:
             daily_composite['confidence'] = confidence
             daily_composite['confidence_explanation'] = conf_explanation
             daily_composite['turning_points'] = turning_points
             daily_composite['realistic_forecasts'] = realistic_forecasts
             
-            # Cập nhật giá dự báo từ realistic_forecasts
-            if 'forecasts' in daily_composite and realistic_forecasts:
+            # Merge giá từ realistic_forecasts vào daily_results
+            if 'daily_results' in daily_composite:
                 for day, forecast_data in realistic_forecasts.items():
-                    if day in daily_composite['forecasts']:
-                        daily_composite['forecasts'][day]['price'] = forecast_data['price']
-                        daily_composite['forecasts'][day]['change_pct'] = forecast_data['change_pct']
-                        daily_composite['forecasts'][day]['direction'] = forecast_data['direction']
+                    if day in daily_composite['daily_results']:
+                        daily_composite['daily_results'][day].update({
+                            'price': forecast_data['price'],
+                            'change_price_pct': forecast_data['change_pct'],
+                            'direction': forecast_data['direction'].upper(),
+                            'volatility_range': forecast_data.get('volatility_range'),
+                            'forecast_confidence': forecast_data.get('confidence', 0.5)
+                        })
         
         result['daily_composite'] = daily_composite
         
-        # 6. Tạo báo cáo markdown (với thông tin mới)
+        # Tạo báo cáo
         markdown_report = generate_forecast_report_markdown_v2(
             symbol,
             indicator_forecast_results,
@@ -2138,25 +2399,25 @@ def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current
             current_price
         )
         
-        # Thêm phần cảnh báo đảo chiều vào báo cáo
-        if turning_points.get('detected'):
+        # Thêm cảnh báo đảo chiều vào báo cáo
+        if turning_points.get('detected') and turning_points.get('details'):
             warning_section = f"\n\n## ⚠️ CẢNH BÁO ĐẢO CHIỀU\n\n"
             warning_section += f"**Loại:** {turning_points.get('type', 'N/A')}\n\n"
+            warning_section += f"**Độ tin cậy:** {turning_points.get('confidence', 0)*100:.0f}%\n\n"
             warning_section += f"**Chi tiết:**\n"
             for detail in turning_points.get('details', []):
                 warning_section += f"- {detail}\n"
-            warning_section += f"\n**Độ tin cậy cảnh báo:** {turning_points.get('confidence', 0)*100:.0f}%\n"
             
-            # Chèn vào sau phần tóm tắt
-            if "## 📊" in markdown_report:
-                parts = markdown_report.split("## 📊", 1)
-                markdown_report = parts[0] + warning_section + "\n## 📊" + parts[1]
+            # Chèn vào đầu báo cáo
+            if markdown_report.startswith("#"):
+                lines = markdown_report.split("\n", 1)
+                markdown_report = lines[0] + "\n" + warning_section + "\n" + (lines[1] if len(lines) > 1 else "")
             else:
                 markdown_report = warning_section + markdown_report
         
         result['markdown_report'] = markdown_report
         
-        # 7. Tạo báo cáo cho Word
+        # Word report
         word_report = generate_forecast_report_for_word(
             symbol,
             indicator_forecast_results,
@@ -2173,7 +2434,8 @@ def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current
         print(f"\n{'='*60}")
         print(f"KẾT QUẢ DỰ BÁO 12 PHƯƠNG PHÁP CHO {symbol}")
         print(f"{'='*60}")
-        print(f"Chỉ báo phân tích: {indicator_forecast_results.get('indicators_analyzed', 0) if indicator_forecast_results else 0}")
+        print(f"Giá hiện tại: {current_price:,.0f}")
+        print(f"Chỉ báo phân tích: {indicator_forecast_results.get('summary', {}).get('indicators_analyzed', 0) if indicator_forecast_results else 0}")
         print(f"Độ tin cậy: {confidence*100:.0f}% ({conf_explanation})")
         
         if turning_points.get('detected'):
@@ -2181,13 +2443,22 @@ def run_12_methods_forecast_v2(df, symbol, weighted_scores, final_score, current
             for detail in turning_points.get('details', []):
                 print(f"   {detail}")
         
-        print(f"\nDỰ BÁO GIÁ:")
+        print(f"\nDỰ BÁO GIÁ (có dao động):")
         for day in ['T1', 'T2', 'T3', 'T4', 'T5']:
             if day in realistic_forecasts:
                 f = realistic_forecasts[day]
                 dir_icon = '📈' if f['direction'] == 'up' else ('📉' if f['direction'] == 'down' else '➡️')
-                print(f"   {day}: {f['price']:,.0f} ({f['change_pct']:+.1f}%) {dir_icon} [Score: {f['score']:.0f}]")
+                vol_range = f.get('volatility_range', (f['price'], f['price']))
+                print(f"   {day}: {f['price']:,.0f} ({f['change_pct']:+.1f}%) {dir_icon}")
+                print(f"       Range: {vol_range[0]:,.0f} - {vol_range[1]:,.0f} | Tin cậy: {f.get('confidence', 0.5)*100:.0f}%")
         
+        return result
+        
+    except Exception as e:
+        print(f"Lỗi run_12_methods_forecast_v2 cho {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
+        result['markdown_report'] = f"## {symbol}\n\n❌ Lỗi: {str(e)}"
         return result
         
     except Exception as e:
@@ -6420,11 +6691,6 @@ def forecast_multi_timeframe(df, symbol):
         'data_confidence': data_confidence,
         'available_indicators': available_indicators,
         'total_indicators': total_indicators
-
-        # Dự báo 12 phương pháp (MỚI)
-        'indicator_forecasts': None,  # Sẽ được gán trong run_analysis
-        'daily_composite': None,
-        'forecast_explanations': [],
 
     }
 
